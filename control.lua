@@ -16,7 +16,7 @@ end
 local function state()
     storage.quality_filter_control = storage.quality_filter_control or {}
     local s = storage.quality_filter_control
-    s.enabled_by_unit = s.enabled_by_unit or {} -- [unit_number] = true/nil
+    s.enabled_by_unit = s.enabled_by_unit or {} -- [unit_number] = LuaEntity (was: true/nil; changed to store entity ref directly)
     s.open_entity_by_player = s.open_entity_by_player or {} -- [player_index] = LuaEntity (supported entity or ghost)
     s.recent_replace_by_pos = s.recent_replace_by_pos or {} -- [pos_key] = { enabled=bool, tick=uint } - used for fast-replace
 
@@ -199,14 +199,18 @@ local function set_enabled(entity, enabled)
     end
 
     local unit = entity.unit_number
-    local was_enabled = (s.enabled_by_unit[unit] == true)
+    local was_enabled = (s.enabled_by_unit[unit] ~= nil)
     local now_enabled = (enabled == true)
 
     if now_enabled then
         if not was_enabled then
             table.insert(s.enabled_unit_array, unit)
         end
-        s.enabled_by_unit[unit] = true
+        -- Store entity reference directly instead of true.
+        -- game.get_entity_by_unit_number() returns nil for valid entities on certain
+        -- surfaces (e.g. Fulgora turbo-splitters), causing the tick handler to
+        -- incorrectly remove the entry as stale on the very next tick.
+        s.enabled_by_unit[unit] = entity
         if cfg.ensure_settings then
             cfg.ensure_settings(entity)
         end
@@ -226,7 +230,7 @@ local function get_enabled(entity)
         return false
     end
 
-    return s.enabled_by_unit[entity.unit_number] == true
+    return s.enabled_by_unit[entity.unit_number] ~= nil
 end
 
 local function get_checkbox(player)
@@ -394,12 +398,18 @@ script.on_event(defines.events.on_gui_opened, function(e)
     end
 end)
 
--- Clear "currently open entity" when GUI closes
+-- Clear "currently open entity" when GUI closes.
+-- Fix: guard with entity identity check so that circuit panel close events
+-- (introduced when splitters gained circuit support in 2.0.67) do not clear
+-- the tracked entity reference before the checkbox state is saved.
 if defines.events.on_gui_closed then
-    script.on_event(defines.events.on_gui_closed, function(e)
-        local s = state()
-        s.open_entity_by_player[e.player_index] = nil
-    end)
+	script.on_event(defines.events.on_gui_closed, function(e)
+		local s = state()
+		local open_entity = s.open_entity_by_player[e.player_index]
+		if open_entity and open_entity.valid and e.entity == open_entity then
+			s.open_entity_by_player[e.player_index] = nil
+		end
+	end)
 end
 
 -- Handle checkbox changes and store them per entity by unit_number
@@ -873,11 +883,14 @@ script.on_event(defines.events.on_tick, function()
         s.enabled_index = s.enabled_index + 1
 
         if unit and s.enabled_by_unit[unit] then
-            local entity = game.get_entity_by_unit_number(unit)
-            if is_supported_entity(entity) then
-                process_enabled_entity(entity)
-            else
+            -- Use stored entity reference directly instead of game.get_entity_by_unit_number().
+            -- get_entity_by_unit_number() returns nil for valid entities on certain surfaces
+            -- (confirmed: Fulgora turbo-splitters), causing immediate false-stale removal.
+            local entity = s.enabled_by_unit[unit]
+            if type(entity) ~= "userdata" or not entity.valid or not is_supported_entity(entity) then
                 s.enabled_by_unit[unit] = nil -- remove stale entry
+            else
+                process_enabled_entity(entity)
             end
         end
     end
