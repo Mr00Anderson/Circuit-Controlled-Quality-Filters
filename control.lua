@@ -3,7 +3,6 @@ local CHECKBOX_NAME = "quality_control_checkbox"
 local TAG_KEY = "quality_control_set_filters"
 local QUALITY_PROXY_PREFIX = "ccqf-quality-"
 local FAST_REPLACE_WINDOW_TICKS = 6
-
 local BATCH_SIZE = 50
 
 -- updates BATCH_SIZE from the map mod setting
@@ -16,15 +15,17 @@ end
 local function state()
     storage.quality_filter_control = storage.quality_filter_control or {}
     local s = storage.quality_filter_control
-    s.enabled_by_unit = s.enabled_by_unit or {} -- [unit_number] = LuaEntity (was: true/nil; changed to store entity ref directly)
+    s.enabled_by_unit = s.enabled_by_unit or {} -- [unit_number] = LuaEntity
     s.open_entity_by_player = s.open_entity_by_player or {} -- [player_index] = LuaEntity (supported entity or ghost)
-    s.recent_replace_by_pos = s.recent_replace_by_pos or {} -- [pos_key] = { enabled=bool, tick=uint } - used for fast-replace
+    s.recent_replace_by_pos = s.recent_replace_by_pos or {} -- [pos_key] = { enabled=bool, tick=uint }
 
-    -- use for scanning updates
+    -- used for scanning updates
     s.enabled_unit_array = s.enabled_unit_array or {} -- array of unit_numbers
     s.enabled_index = s.enabled_index or 1 -- round-robin position
     s.gui_type_by_player = s.gui_type_by_player or {} -- [player_index] = relative_gui_type
 
+    -- per-entity signal fingerprint cache to skip redundant work when signals are stable
+    s.filter_cache_by_unit = s.filter_cache_by_unit or {} -- [unit_number] = { hash = string }
     return s
 end
 
@@ -49,20 +50,16 @@ local function ensure_correct_filter_settings_inserter(entity)
     if not (entity and entity.valid and entity.type == "inserter") then
         return
     end
-
     if (entity.filter_slot_count or 0) == 0 then
         return
     end
-
     local control_behavior = entity.get_control_behavior()
     if control_behavior and control_behavior.valid and control_behavior.circuit_set_filters then
         control_behavior.circuit_set_filters = false
     end
-
     if not entity.use_filters then
         entity.use_filters = true
     end
-
     if entity.inserter_filter_mode ~= "whitelist" then
         entity.inserter_filter_mode = "whitelist"
     end
@@ -73,12 +70,10 @@ local function ensure_correct_filter_settings_splitter(entity)
     if not (entity and entity.valid and entity.type == "splitter") then
         return
     end
-
     local control_behavior = entity.get_control_behavior()
     if control_behavior and control_behavior.valid and control_behavior.set_filter then
         control_behavior.set_filter = false
     end
-
 end
 
 local ENTITY_CONFIG = {
@@ -155,15 +150,12 @@ local function is_supported_entity(entity)
     if not (entity and entity.valid and entity.unit_number and entity.type ~= "entity-ghost") then
         return false
     end
-
     if not get_entity_config(entity) then
         return false
     end
-
     if get_max_filters(entity) == 0 then
         return false
     end
-
     return true
 end
 
@@ -171,11 +163,9 @@ local function is_supported_or_ghost(entity)
     if not (entity and entity.valid) then
         return false
     end
-
     if entity.type == "entity-ghost" then
         return ENTITY_CONFIG[entity.ghost_type] ~= nil
     end
-
     return is_supported_entity(entity)
 end
 
@@ -188,16 +178,13 @@ local function set_enabled(entity, enabled)
         entity.tags = tags
         return
     end
-
     if not is_supported_entity(entity) then
         return
     end
-
     local cfg = get_entity_config(entity)
     if not cfg then
         return
     end
-
     local unit = entity.unit_number
     local was_enabled = (s.enabled_by_unit[unit] ~= nil)
     local now_enabled = (enabled == true)
@@ -211,11 +198,14 @@ local function set_enabled(entity, enabled)
         -- surfaces (e.g. Fulgora turbo-splitters), causing the tick handler to
         -- incorrectly remove the entry as stale on the very next tick.
         s.enabled_by_unit[unit] = entity
+        -- Force re-evaluation on next visit (entity may have been edited while disabled).
+        s.filter_cache_by_unit[unit] = nil
         if cfg.ensure_settings then
             cfg.ensure_settings(entity)
         end
     else
         s.enabled_by_unit[unit] = nil
+        s.filter_cache_by_unit[unit] = nil
     end
 end
 
@@ -225,11 +215,9 @@ local function get_enabled(entity)
         local tags = entity.tags
         return tags and tags[TAG_KEY] == true or false
     end
-
     if not is_supported_entity(entity) then
         return false
     end
-
     return s.enabled_by_unit[entity.unit_number] ~= nil
 end
 
@@ -261,13 +249,11 @@ end
 -- create the setting gui for the player if needed
 local function ensure_gui(player, entity)
     local relative = player.gui.relative
-
     local cfg = get_entity_config(entity)
     if not cfg then
         destroy_gui(player)
         return
     end
-
     local s = state()
     local root = relative[ROOT_NAME]
     if root and root.valid then
@@ -307,26 +293,15 @@ local function destroy_gui_for_all_players()
 end
 
 local function rebuild_enabled_unit_array(s)
-    local before_length = #(s.enabled_unit_array or {})
-
     local array = {}
     for unit, _ in pairs(s.enabled_by_unit) do
         table.insert(array, unit)
     end
     s.enabled_unit_array = array
-
     local after_length = #array
     if after_length == 0 or s.enabled_index > after_length then
         s.enabled_index = 1
     end
-
-    -- debug_print(("rebuild_enabled_unit_array: before_length=%d after_length=%d enabled_by_unit=%d tick=%d"):format(before_length, after_length, (function()
-    --     local c = 0
-    --     for _ in pairs(s.enabled_by_unit) do
-    --         c = c + 1
-    --     end
-    --     return c
-    -- end)(), game.tick))
 end
 
 script.on_init(function()
@@ -341,6 +316,7 @@ script.on_configuration_changed(function()
     update_batch_size()
     local s = state()
     s.open_entity_by_player = {}
+    s.filter_cache_by_unit = {} -- invalidate cache across config changes (quality/prototype set may have shifted)
     destroy_gui_for_all_players()
     rebuild_enabled_unit_array(s)
 end)
@@ -386,11 +362,10 @@ script.on_event(defines.events.on_gui_opened, function(e)
 
     if is_supported_or_ghost(entity) then
         ensure_gui(player, entity)
-        s.open_entity_by_player[e.player_index] = entity -- save which entity the player has open
-
+        s.open_entity_by_player[e.player_index] = entity
         local checkbox = get_checkbox(player)
         if checkbox then
-            checkbox.state = get_enabled(entity) -- sync checkbox setting from saved state
+            checkbox.state = get_enabled(entity)
         end
     else
         s.open_entity_by_player[e.player_index] = nil
@@ -403,13 +378,13 @@ end)
 -- (introduced when splitters gained circuit support in 2.0.67) do not clear
 -- the tracked entity reference before the checkbox state is saved.
 if defines.events.on_gui_closed then
-	script.on_event(defines.events.on_gui_closed, function(e)
-		local s = state()
-		local open_entity = s.open_entity_by_player[e.player_index]
-		if open_entity and open_entity.valid and e.entity == open_entity then
-			s.open_entity_by_player[e.player_index] = nil
-		end
-	end)
+    script.on_event(defines.events.on_gui_closed, function(e)
+        local s = state()
+        local open_entity = s.open_entity_by_player[e.player_index]
+        if open_entity and open_entity.valid and e.entity == open_entity then
+            s.open_entity_by_player[e.player_index] = nil
+        end
+    end)
 end
 
 -- Handle checkbox changes and store them per entity by unit_number
@@ -424,7 +399,6 @@ script.on_event(defines.events.on_gui_checked_state_changed, function(e)
     if not is_supported_or_ghost(entity) then
         return
     end
-
     set_enabled(entity, element.state)
 end)
 
@@ -435,6 +409,7 @@ local function cleanup_entity(entity)
     end
     local s = state()
     s.enabled_by_unit[entity.unit_number] = nil
+    s.filter_cache_by_unit[entity.unit_number] = nil
 end
 
 local function pos_key(entity)
@@ -443,7 +418,6 @@ local function pos_key(entity)
 end
 
 local destroy_events = {defines.events.on_player_mined_entity, defines.events.on_robot_mined_entity, defines.events.on_entity_died, defines.events.script_raised_destroy}
-
 script.on_event(destroy_events, function(e)
     local entity = e.entity
     if is_supported_entity(entity) then
@@ -455,26 +429,23 @@ script.on_event(destroy_events, function(e)
             }
         end
     end
-
     cleanup_entity(entity)
 end)
 
 local build_events = {
     defines.events.on_built_entity, defines.events.on_robot_built_entity, defines.events.on_space_platform_built_entity, defines.events.script_raised_built, defines.events.script_raised_revive
 }
-
 script.on_event(build_events, function(e)
     local entity = e.entity
     if not is_supported_entity(entity) then
         return
     end
-
     local s = state()
 
     -- blueprint/ghost tags
     if e.tags and e.tags[TAG_KEY] == true then
         set_enabled(entity, true)
-        s.recent_replace_by_pos[pos_key(entity)] = nil -- clear any stale cache for this tile
+        s.recent_replace_by_pos[pos_key(entity)] = nil
         return
     end
 
@@ -509,15 +480,12 @@ local function sync_checkbox_for_entity(changed_entity)
 end
 
 local copy_events = {defines.events.on_entity_settings_pasted, defines.events.on_entity_cloned}
-
 script.on_event(copy_events, function(e)
     local source = e.source
     local destination = e.destination
-
     if not (is_supported_or_ghost(source) and is_supported_or_ghost(destination)) then
         return
     end
-
     local enabled = get_enabled(source)
     set_enabled(destination, enabled)
     sync_checkbox_for_entity(destination)
@@ -530,12 +498,10 @@ local function stamp_tags_to_blueprint(player_index, blueprint_stack, mapping_la
     if not (mapping_lazy and mapping_lazy.valid) then
         return
     end
-
     local mapping = mapping_lazy:get()
     if not mapping then
         return
     end
-
     local entities = blueprint_stack.get_blueprint_entities()
     if not entities then
         return
@@ -554,7 +520,6 @@ script.on_event(defines.events.on_player_setup_blueprint, function(e)
     if not player then
         return
     end
-
     local bp = e.stack
     if not (bp and bp.valid_for_read and bp.is_blueprint) then
         bp = player.cursor_stack
@@ -562,94 +527,115 @@ script.on_event(defines.events.on_player_setup_blueprint, function(e)
     if not (bp and bp.valid_for_read and bp.is_blueprint) then
         return
     end
-
     stamp_tags_to_blueprint(e.player_index, bp, e.mapping)
 end)
 
-local function read_signal(entity, signal_id)
-    local signal = entity.get_signal(signal_id, defines.wire_connector_id.circuit_red, defines.wire_connector_id.circuit_green)
-    return signal or 0
-end
+-- Comparator signal name -> operator string
+local COMPARATOR_MAP = {
+    ["signal-greater-than"] = ">",
+    ["signal-less-than"] = "<",
+    ["signal-equal"] = "=",
+    ["signal-greater-than-or-equal-to"] = ">=",
+    ["signal-less-than-or-equal-to"] = "<=",
+    ["signal-not-equal"] = "!="
+}
 
-local function gather_signals(entity)
-    local totals = {} -- key -> { signal = SignalID, count = int }
-
-    -- Create keys to merge identical signals
-    local function key_for(id)
-        local k = tostring(id.type) .. ":" .. tostring(id.name)
-        if id.quality ~= nil then
-            k = k .. ":" .. tostring(id.quality)
-        end
-        return k
+-- Cheap fingerprint + raw signal fetch.
+-- Uses single API call with both wire connectors merged by the engine.
+-- Avoids any proto lookups, map construction, or sorts on the cache-hit path.
+--
+-- Returns:
+--   fingerprint :: string (empty if no signals)
+--   signals     :: raw signal array (or nil) for subsequent extract_all if needed
+local function compute_fingerprint(entity)
+    local signals = entity.get_signals(defines.wire_connector_id.circuit_red, defines.wire_connector_id.circuit_green)
+    if not signals then
+        return "", nil
     end
-
-    local function add_from(connector_id)
-        local signals = entity.get_signals(connector_id)
-        if not signals then
-            return
-        end
-
-        for _, s in ipairs(signals) do
-            local id = s.signal
-            local c = s.count or 0
-            if id and c > 0 then
-                local k = key_for(id)
-                local existing = totals[k]
-                if existing then
-                    existing.count = existing.count + c
-                else
-                    totals[k] = {
-                        signal = id,
-                        count = c
-                    }
-                end
-            end
-        end
-    end
-
-    add_from(defines.wire_connector_id.circuit_red)
-    add_from(defines.wire_connector_id.circuit_green)
-
-    local combined = {} -- { signal = SignalID, count = int }
-    for _, v in pairs(totals) do
-        combined[#combined + 1] = v
-    end
-    return combined
-end
-
--- Filter/sort quality signals out of a combined signal list
--- Input: array of { signal = SignalID, count = int }
--- Returns: array of { quality = QualityID, value = int, level = int }
-local function extract_quality_signals_sorted(combined_signals)
-    local present = {}
-
-    for _, s in ipairs(combined_signals or {}) do
+    local fp = {}
+    for _, s in ipairs(signals) do
         local id = s.signal
         local c = s.count or 0
-        if id and c > 0 then
-            -- Support both real quality signals (type="quality") and generated proxy signals
-            local qname = nil
-            if id.type == "quality" then
-                qname = id.name
-            elseif id.type == "virtual" and type(id.name) == "string" and id.name:sub(1, #QUALITY_PROXY_PREFIX) == QUALITY_PROXY_PREFIX then
-                qname = id.name:sub(#QUALITY_PROXY_PREFIX + 1)
+        if id and id.name and c ~= 0 then
+            fp[#fp + 1] = tostring(id.type) .. ":" .. tostring(id.name) .. ":" .. tostring(id.quality or "") .. "=" .. c
+        end
+    end
+    return table.concat(fp, "|"), signals
+end
+
+-- Full extraction. Only called on cache miss, using the raw signals already fetched.
+--
+-- Returns:
+--   qualities  :: array of { quality = string, value = int, level = int }, sorted desc
+--   items      :: array of { name = string, value = int, order = string }, sorted desc
+--   comparator :: ComparatorString or nil when there is a tied-strongest conflict
+--   conflict   :: boolean (true if comparator tie)
+local function extract_all(signals)
+    local qualities_by_name = {}
+    local items_by_name = {}
+    local comp_counts = {}
+
+    for _, s in ipairs(signals) do
+        local id = s.signal
+        local c = s.count or 0
+        if id and id.name and c > 0 then
+            local name = id.name
+            local stype = id.type
+
+            -- Quality (real quality signal or virtual proxy)
+            local qname
+            if stype == "quality" then
+                qname = name
+            elseif stype == "virtual" and type(name) == "string" and name:sub(1, #QUALITY_PROXY_PREFIX) == QUALITY_PROXY_PREFIX then
+                qname = name:sub(#QUALITY_PROXY_PREFIX + 1)
+            end
+            if qname then
+                local proto = prototypes.quality[qname]
+                if proto then
+                    local entry = qualities_by_name[qname]
+                    if entry then
+                        entry.value = entry.value + c
+                    else
+                        qualities_by_name[qname] = {
+                            quality = qname,
+                            value = c,
+                            level = proto.level or 0
+                        }
+                    end
+                end
             end
 
-            if qname then
-                local q = prototypes.quality[qname]
-                if q then
-                    present[#present + 1] = {
-                        quality = qname,
+            -- Item
+            if stype == "item" or stype == "item-with-quality" or prototypes.item[name] then
+                local entry = items_by_name[name]
+                if entry then
+                    entry.value = entry.value + c
+                else
+                    local iproto = prototypes.item[name]
+                    items_by_name[name] = {
+                        name = name,
                         value = c,
-                        level = q.level or 0
+                        order = iproto and iproto.order or ""
                     }
+                end
+            end
+
+            -- Comparator (virtual signal)
+            if stype == "virtual" then
+                local cmp = COMPARATOR_MAP[name]
+                if cmp then
+                    comp_counts[cmp] = (comp_counts[cmp] or 0) + c
                 end
             end
         end
     end
 
-    -- sort: signal count desc, then quality tier desc, then name
-    table.sort(present, function(a, b)
+    -- Flatten + sort qualities: value desc, level desc, name asc
+    local qualities = {}
+    for _, v in pairs(qualities_by_name) do
+        qualities[#qualities + 1] = v
+    end
+    table.sort(qualities, function(a, b)
         if a.value ~= b.value then
             return a.value > b.value
         end
@@ -659,50 +645,12 @@ local function extract_quality_signals_sorted(combined_signals)
         return a.quality < b.quality
     end)
 
-    return present
-end
-
-local function is_item_signal(id)
-    if not id or not id.name then
-        return false
+    -- Flatten + sort items: value desc, order asc, name asc
+    local items = {}
+    for _, v in pairs(items_by_name) do
+        items[#items + 1] = v
     end
-    if id.type == "item" or id.type == "item-with-quality" then
-        return true
-    end
-    return prototypes.item[id.name] ~= nil
-end
-
--- Filter/sort item signals out of a combined signal list
--- Input: array of { signal = SignalID, count = int }
--- Returns: array of { name = string, value = int, order = string }
-local function extract_item_signals_sorted(combined_signals)
-    local by_name = {}
-
-    for _, s in ipairs(combined_signals or {}) do
-        local id = s.signal
-        local c = s.count or 0
-        if is_item_signal(id) and c > 0 then
-            local entry = by_name[id.name]
-            if entry then
-                entry.value = entry.value + c
-            else
-                local proto = prototypes.item[id.name]
-                by_name[id.name] = {
-                    name = id.name,
-                    value = c,
-                    order = proto and proto.order or ""
-                }
-            end
-        end
-    end
-
-    local present = {}
-    for _, v in pairs(by_name) do
-        present[#present + 1] = v
-    end
-
-    -- sort: signal count desc, then item order, then name
-    table.sort(present, function(a, b)
+    table.sort(items, function(a, b)
         if a.value ~= b.value then
             return a.value > b.value
         end
@@ -712,52 +660,26 @@ local function extract_item_signals_sorted(combined_signals)
         return a.name < b.name
     end)
 
-    return present
-end
-
--- Returns:
---   comparator :: ComparatorString (e.g. "=", ">", "<", ">=", "<=", "!=")
---   conflict   :: boolean  (true if strongest comparator is tied with another)
-local function extract_comparator_signal(signals)
-    local MAP = {
-        ["signal-greater-than"] = ">",
-        ["signal-less-than"] = "<",
-        ["signal-equal"] = "=",
-        ["signal-greater-than-or-equal-to"] = ">=",
-        ["signal-less-than-or-equal-to"] = "<=",
-        ["signal-not-equal"] = "!="
-    }
-
-    local best = "="
-    local best_count = 0
+    -- Resolve strongest comparator signal
+    local best_cmp = "="
+    local best_cnt = 0
     local conflict = false
-
-    for _, s in ipairs(signals or {}) do
-        local id = s.signal
-        local c = s.count or 0
-        if id and id.type == "virtual" and c > 0 then
-            local comparator = MAP[id.name]
-            if comparator then
-                if c > best_count then
-                    best = comparator
-                    best_count = c
-                    conflict = false
-                elseif c == best_count and comparator ~= best then
-                    conflict = true
-                end
-            end
+    for cmp, cnt in pairs(comp_counts) do
+        if cnt > best_cnt then
+            best_cmp = cmp
+            best_cnt = cnt
+            conflict = false
+        elseif cnt == best_cnt and cmp ~= best_cmp then
+            conflict = true
         end
     end
-
-    if best_count == 0 then
-        return "=", false
+    if best_cnt == 0 then
+        best_cmp = "="
+        conflict = false
     end
+    local comparator = conflict and nil or best_cmp
 
-    if conflict then
-        return nil, true
-    end
-
-    return best, false
+    return qualities, items, comparator, conflict
 end
 
 local function are_filters_equal(a, b)
@@ -779,7 +701,6 @@ local function apply_entity_filters(entity, desired_filters)
     if not is_supported_entity(entity) then
         return
     end
-
     local cfg = get_entity_config(entity)
     if not cfg then
         return
@@ -803,35 +724,57 @@ local function process_enabled_entity(entity)
     if not is_supported_entity(entity) then
         return
     end
-
     local cfg = get_entity_config(entity)
     if not cfg then
         return
     end
-
     local max_slots = get_max_filters(entity)
     if max_slots == 0 then
         return
     end
 
-    local signals = gather_signals(entity)
-    local qualities = extract_quality_signals_sorted(signals)
-    local items = extract_item_signals_sorted(signals)
-    local comparator, conflict = extract_comparator_signal(signals)
-    local filters = {}
+    local s = state()
+    local unit = entity.unit_number
+    local cache = s.filter_cache_by_unit[unit]
 
-    -- clear filters if strongest comparator signals are tied
-    if conflict then
-        apply_entity_filters(entity, filters)
+    -- Cheap fingerprint first. Single API call, no proto lookups, no sorts.
+    local fingerprint, signals = compute_fingerprint(entity)
+
+    -- Fast path: signals unchanged since last apply, no recomputation needed.
+    if cache and cache.hash == fingerprint then
         return
     end
 
-    -- Build desired filters in sorted order
+    local filters = {}
+
+    -- No signals at all: clear filters and cache.
+    if fingerprint == "" then
+        apply_entity_filters(entity, filters)
+        s.filter_cache_by_unit[unit] = {
+            hash = fingerprint
+        }
+        return
+    end
+
+    -- Cache miss with signals present: do the expensive extraction now.
+    local qualities, items, comparator, conflict = extract_all(signals)
+
+    -- Tied comparator conflict: clear filters.
+    if conflict then
+        apply_entity_filters(entity, filters)
+        s.filter_cache_by_unit[unit] = {
+            hash = fingerprint
+        }
+        return
+    end
+
+    -- Build desired filter list.
     if not cfg.allow_item_quality then
         items = {}
     end
 
     if #items > 0 and qualities[1] then
+        -- Item x Quality combinations, quality-major ordering
         local slot = 1
         for _, q in ipairs(qualities) do
             for _, it in ipairs(items) do
@@ -849,19 +792,25 @@ local function process_enabled_entity(entity)
                 break
             end
         end
-    else
-        if not cfg.allow_quality_only then
-            return
-        end
+    elseif cfg.allow_quality_only then
         for i, entry in ipairs(qualities) do
             filters[i] = {
                 quality = entry.quality,
                 comparator = comparator
             }
         end
+    else
+        -- Entity only supports item-quality pairs, none available -> no-op cache update
+        s.filter_cache_by_unit[unit] = {
+            hash = fingerprint
+        }
+        return
     end
 
     apply_entity_filters(entity, filters)
+    s.filter_cache_by_unit[unit] = {
+        hash = fingerprint
+    }
 end
 
 -- loop through enabled entities in batches
@@ -874,7 +823,6 @@ script.on_event(defines.events.on_tick, function()
     end
 
     for _ = 1, math.min(BATCH_SIZE, n) do
-        -- wrap index position
         if s.enabled_index > n then
             s.enabled_index = 1
         end
@@ -888,7 +836,8 @@ script.on_event(defines.events.on_tick, function()
             -- (confirmed: Fulgora turbo-splitters), causing immediate false-stale removal.
             local entity = s.enabled_by_unit[unit]
             if type(entity) ~= "userdata" or not entity.valid or not is_supported_entity(entity) then
-                s.enabled_by_unit[unit] = nil -- remove stale entry
+                s.enabled_by_unit[unit] = nil
+                s.filter_cache_by_unit[unit] = nil
             else
                 process_enabled_entity(entity)
             end
